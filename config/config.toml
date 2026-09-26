@@ -1,0 +1,37 @@
+# FreeWili 2 CM0 / NETGEAR A6150 or Archer T3U. Initial validation is passive.
+main.name = ""
+main.iface = "pwn0"
+main.allowed_bssids = []
+main.mon_start_cmd = ""
+main.mon_stop_cmd = ""
+main.custom_plugins = "/opt/gothcwili/plugins"
+main.no_restart = true
+main.plugins.freewili.enabled = true
+main.plugins.grid.enabled = false
+main.plugins.auto-update.enabled = false
+main.plugins.led.enabled = false
+main.plugins.session-stats.enabled = false
+main.log.path = "/var/log/gothcwili/pwnagotchi.log"
+ai.enabled = true
+ai.path = "/var/lib/gothcwili/brain-a2c.zip"
+ai.channels = [1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165]
+ai.epochs_per_episode = 5
+ai.laziness = 0.1
+personality.advertise = true
+personality.deauth = false
+personality.associate = false
+# Non-DFS channels for initial validation; adapt to the local regulatory domain.
+personality.channels = [1, 6, 11, 36, 44, 149, 157]
+ui.fps = 1.0
+# This layout produces the upstream web frame. The FreeWili plugin drives the LCD.
+ui.display.enabled = false
+ui.display.type = "waveshare_2"
+ui.web.enabled = false
+ui.web.address = "127.0.0.1"
+bettercap.hostname = "127.0.0.1"
+bettercap.port = 8081
+bettercap.username = "gothcwili"
+# Replaced with a random local password by install.sh.
+bettercap.password = "GENERATE_ON_INSTALL"
+bettercap.handshakes = "/var/lib/gothcwili/handshakes"
+fs.memory.enabled = false

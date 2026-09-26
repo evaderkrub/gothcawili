@@ -1,0 +1,147 @@
+--- a/freewilifpga/fpga/src/dsn/cm0_router_ctrl.v
++++ b/freewilifpga/fpga/src/dsn/cm0_router_ctrl.v
+@@ -101,6 +101,7 @@
+ localparam [2:0] ST_RSP_READ  = 3'd2; // Bridge arbiter read stream to payload
+ localparam [2:0] ST_RSP_FIXED = 3'd3; // Stream a small fixed payload buffer
+ localparam [2:0] ST_RSP_ABORT_WAIT = 3'd4; // Wait for the truncated frame to finish
++localparam [2:0] ST_RSP_DRAIN = 3'd6; // Wait for CRC/COBS delimiter to leave encoder
+ localparam [2:0] ST_RSP_MBOX  = 3'd5; // Stream the outbox body as the payload
+ 
+ reg  [2:0]  rsp_state;
+@@ -604,14 +605,7 @@
+           nak_abort_seq   <= rsp_seq;
+           rsp_state       <= ST_RSP_ABORT_WAIT;
+         end else if (rsp_left == 16'd0) begin
+-          if (rsp_is_read) begin
+-            last_completed_seq <= rsp_seq;
+-          end
+-          if (rsp_is_mbox) begin
+-            mbox_out_done <= 1'b1;
+-            rsp_is_mbox   <= 1'b0;
+-          end
+-          rsp_state <= ST_RSP_IDLE;
++          rsp_state <= ST_RSP_DRAIN;
+         end else if (rsp_is_read) begin
+           rsp_state <= ST_RSP_READ;
+         end else if (rsp_is_mbox) begin
+@@ -632,8 +626,7 @@
+           rsp_state       <= ST_RSP_ABORT_WAIT;
+         end else if (rd_valid & payload_ready) begin
+           if (rsp_left == 16'd1) begin
+-            last_completed_seq <= rsp_seq;
+-            rsp_state          <= ST_RSP_IDLE;
++            rsp_state          <= ST_RSP_DRAIN;
+           end else begin
+             rsp_left <= rsp_left - 16'd1;
+           end
+@@ -651,7 +644,7 @@
+         // Payload mux presents fix_buf[fix_idx]; advance on each accept.
+         if (payload_ready) begin
+           if (rsp_left == 16'd1) begin
+-            rsp_state <= ST_RSP_IDLE;
++            rsp_state <= ST_RSP_DRAIN;
+           end else begin
+             fix_idx  <= fix_idx + 3'd1;
+             rsp_left <= rsp_left - 16'd1;
+@@ -664,9 +657,7 @@
+         // accept. On the final byte free the outbox and return to idle.
+         if (payload_ready) begin
+           if (rsp_left == 16'd1) begin
+-            mbox_out_done <= 1'b1;
+-            rsp_is_mbox   <= 1'b0;
+-            rsp_state     <= ST_RSP_IDLE;
++            rsp_state     <= ST_RSP_DRAIN;
+           end else begin
+             rsp_mbox_idx <= rsp_mbox_idx + 6'd1;
+             rsp_left     <= rsp_left - 16'd1;
+@@ -674,6 +665,21 @@
+         end
+       end
+ 
++      ST_RSP_DRAIN: begin
++        // Accepting the last payload byte does not finish a frame. The encoder
++        // still owns its CRC and COBS output until frame_done, especially when
++        // UART CTS pauses during a CM0 restart. An early msg_start is lost and
++        // strands this FSM waiting for payload_ready forever.
++        if (frame_done) begin
++          if (rsp_is_read) last_completed_seq <= rsp_seq;
++          if (rsp_is_mbox) begin
++            mbox_out_done <= 1'b1;
++            rsp_is_mbox <= 1'b0;
++          end
++          rsp_state <= ST_RSP_IDLE;
++        end
++      end
++
+       default: rsp_state <= ST_RSP_IDLE;
+     endcase
+   end
+--- a/freewilifpga/fpga/src/dsn/fwili_top.v
++++ b/freewilifpga/fpga/src/dsn/fwili_top.v
+@@ -1,8 +1,8 @@
+ module fwili_top
+ #
+ (
+-  parameter integer G_CLK_FREQ_HZ = 31_250_000,
+-  parameter integer G_BAUD_RATE   = 7_812_500
++  parameter integer G_CLK_FREQ_HZ = 20_000_000,
++  parameter integer G_BAUD_RATE   = 5_000_000
+ )
+ (
+   input   clk,
+--- a/freewilimain/targets/fw2main/Fw2MainAppSetup.cpp
++++ b/freewilimain/targets/fw2main/Fw2MainAppSetup.cpp
+@@ -70,12 +70,13 @@
+ // it never managed to configure.
+ volatile bool g_bFpgaBootConfigured = false;
+ 
+-// FPGA fabric clock divider for the CM0 router UART: 150MHz / (4 + 205/256) =
+-// 31.245 MHz (within UART tolerance). Kept fixed at boot regardless of the
++// Pwnagotchi build: timing-checked FPGA clock; CM0 UART is 5 Mbaud.
++// FPGA fabric clock divider for the CM0 router UART: 150MHz / (7 + 128/256) =
++// 20 MHz (within UART tolerance). Kept fixed at boot regardless of the
+ // user-adjustable FPGA clock menu so the CM0 UART baud stays locked.
+ // (Was fwMenuSettings::FPGA_CLK_DIV_*_DEFAULT before the MenuX settings port.)
+-#define FPGA_CLK_DIV_INT_DEFAULT   4
+-#define FPGA_CLK_DIV_FRAC_DEFAULT  205
++#define FPGA_CLK_DIV_INT_DEFAULT   7
++#define FPGA_CLK_DIV_FRAC_DEFAULT  128
+ 
+ #define TEST_SIZE (1024*8)
+ #include <hardware/flash.h>
+@@ -518,7 +519,7 @@
+ 
+ 	// Drive the FPGA fabric clock to ~31.25 MHz for the CM0 router UART WITHOUT
+     // changing clk_sys (keep the stock 150 MHz so the system timer/tick stays
+-    // intact). 150MHz / (4 + 205/256) = 31.245 MHz (within UART tolerance).
++    // intact). 150MHz / (7 + 128/256) = 20 MHz (within UART tolerance).
+     clock_gpio_init_int_frac(FPGA_CLK, CLOCKS_CLK_GPOUT1_CTRL_AUXSRC_VALUE_CLK_SYS, 4, 205);
+ 	sleep_ms(10);
+ 
+@@ -610,9 +611,14 @@
+ 
+     // Drive the FPGA fabric clock to ~31.25 MHz for the CM0 router UART WITHOUT
+     // changing clk_sys (keep the stock 150 MHz so the system timer/tick stays
+-    // intact). 150MHz / (4 + 205/256) = 31.245 MHz (within UART tolerance).
++    // intact). 150MHz / (7 + 128/256) = 20 MHz (within UART tolerance).
+     clock_gpio_init_int_frac(FPGA_CLK, CLOCKS_CLK_GPOUT1_CTRL_AUXSRC_VALUE_CLK_SYS,
+                              FPGA_CLK_DIV_INT_DEFAULT, FPGA_CLK_DIV_FRAC_DEFAULT);
++    // Keep the displayed/applied settings consistent with the bridge clock.
++    obMenuFPGAClockSettings.m_iClockSource = 0;
++    obMenuFPGAClockSettings.m_iDividerInt = FPGA_CLK_DIV_INT_DEFAULT;
++    obMenuFPGAClockSettings.m_iDividerFrac = FPGA_CLK_DIV_FRAC_DEFAULT;
++    obMenu.m_dActualFPGAClock = 20000000.0;
+ 
+ 
+ 	//Main Panel Apps
+--- a/freewilimain/fwProgIODir.h
++++ b/freewilimain/fwProgIODir.h
+@@ -30,7 +30,7 @@
+ 		const unsigned char btWrCmd  = 0x00;
+ 		
+ 		// SPI settings for FPGA communication
+-		const unsigned int iSPIBitRate = 3250000; // 3.25 MHz
++		const unsigned int iSPIBitRate = 2000000; // 20 MHz FPGA profile: retain ten fabric clocks per SPI bit
+ 		const unsigned int iSPIBitCount = 8; // 8 data bits
+ 		const bool bSPI_CPOL = false; // Clock polarity
+ 		const bool bSPI_CPHA = false; // Clock phase

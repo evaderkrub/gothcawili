@@ -1,0 +1,18 @@
+[Unit]
+Description=Pwnagotchi on FreeWili 2 CM0
+Requires=fwcm0-bridge.service
+After=fwcm0-bridge.service NetworkManager.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gothcwili
+ExecStart=/opt/gothcwili-venv/bin/python /opt/gothcwili/run.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+KillMode=mixed
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLBACKEND=Agg
+
+[Install]
+WantedBy=multi-user.target

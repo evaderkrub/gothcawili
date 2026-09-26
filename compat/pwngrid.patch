@@ -1,0 +1,234 @@
+--- a/wifi/pack.go
++++ b/wifi/pack.go
+@@ -18,7 +18,10 @@
+ 
+ func PackOneOf(from, to net.HardwareAddr, peerID []byte, signature []byte, streamID uint64, seqNum uint64, seqTot uint64, payload []byte, compress bool) (error, []byte) {
+ 	stack := []gopacket.SerializableLayer{
+-		&layers.RadioTap{},
++		&layers.RadioTap{
++			Present:        []layers.RadioTapPresent{0},
++			RadioTapValues: []layers.RadioTapNamespace{{}},
++		},
+ 		&layers.Dot11{
+ 			Address1: to,
+ 			Address2: SignatureAddr,
+--- /dev/null
++++ b/wifi/pack_test.go
+@@ -0,0 +1,39 @@
++package wifi
++
++import (
++	"encoding/binary"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
++	"net"
++	"testing"
++)
++
++func TestPackRadiotapAndPayload(t *testing.T) {
++	payload := []byte(`{"name":"SIMULATION"}`)
++	err, raw := Pack(net.HardwareAddr{2, 0, 0, 0, 0, 1}, net.HardwareAddr{255, 255, 255, 255, 255, 255}, payload, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n := binary.LittleEndian.Uint16(raw[2:4]); n < 8 {
++		t.Fatalf("invalid radiotap length %d", n)
++	}
++	packet := gopacket.NewPacket(raw, layers.LayerTypeRadioTap, gopacket.Default)
++	if e := packet.ErrorLayer(); e != nil {
++		t.Fatal(e.Error())
++	}
++	radio := packet.Layer(layers.LayerTypeRadioTap).(*layers.RadioTap)
++	if radio.RadioTapValues[0].Flags.FCS() {
++		t.Fatal("TX must leave FCS generation to the driver")
++	}
++	dot := packet.Layer(layers.LayerTypeDot11).(*layers.Dot11)
++	if !dot.ChecksumValid() {
++		t.Fatal("invalid FCS")
++	}
++	err, decoded := Unpack(packet, radio, dot)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(decoded) != string(payload) {
++		t.Fatalf("payload mismatch %q", decoded)
++	}
++}
+--- a/mesh/peer.go
++++ b/mesh/peer.go
+@@ -4,11 +4,9 @@
+ 	"bytes"
+ 	"crypto/rand"
+ 	"encoding/base64"
+-	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
+-	"reflect"
+ 	"regexp"
+ 	"strings"
+ 	"sync"
+@@ -55,14 +53,14 @@
+ func MakeLocalPeer(name string, keys *crypto.KeyPair, advertise bool) *Peer {
+ 	now := time.Now()
+ 	peer := &Peer{
+-		DetectedAt:    now,
+-		SeenAt:        now,
+-		PrevSeenAt:    now,
+-		SessionID:     make([]byte, 6),
+-		Keys:          keys,
+-		AdvData:       sync.Map{},
+-		AdvPeriod:     SignalingPeriod,
+-		stop:          make(chan struct{}),
++		DetectedAt: now,
++		SeenAt:     now,
++		PrevSeenAt: now,
++		SessionID:  make([]byte, 6),
++		Keys:       keys,
++		AdvData:    sync.Map{},
++		AdvPeriod:  SignalingPeriod,
++		stop:       make(chan struct{}),
+ 		// advertising starts enabled whenever -advertise is true, instead of
+ 		// staying off until pwnagotchi's one-time startup call to
+ 		// /api/v1/mesh/true flips it on: that call never repeats, so if
+@@ -363,92 +361,17 @@
+ 	peer.stop <- struct{}{}
+ }
+ 
+-// helper: extract channel frequency (MHz) from RadioTap
++// gopacket v1.5 stores decoded values in typed radiotap namespaces.
+ func channelFromRadioTap(r *layers.RadioTap) int {
+-	if r == nil {
+-		return 0
+-	}
+-
+-	// try direct exported field via reflection (works across gopacket versions)
+-	rv := reflect.ValueOf(r)
+-	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+-		rv = rv.Elem()
+-		if rv.IsValid() && rv.Kind() == reflect.Struct {
+-			if f := rv.FieldByName("ChannelFrequency"); f.IsValid() {
+-				switch f.Kind() {
+-				case reflect.Uint16, reflect.Uint32, reflect.Uint64:
+-					return int(f.Uint())
+-				case reflect.Int, reflect.Int32, reflect.Int64:
+-					return int(f.Int())
+-				}
+-			}
+-		}
+-	}
+-
+-	// fallback: scan RadioTapValues for a 2-byte little-endian frequency
+-	for _, ns := range r.RadioTapValues {
+-		sv := reflect.ValueOf(ns)
+-		if sv.Kind() == reflect.Struct {
+-			for _, name := range []string{"Data", "Value"} {
+-				if f := sv.FieldByName(name); f.IsValid() && f.Kind() == reflect.Slice && f.Type().Elem().Kind() == reflect.Uint8 {
+-					b := f.Bytes()
+-					if len(b) >= 2 {
+-						freq := int(binary.LittleEndian.Uint16(b[:2]))
+-						if freq >= 2000 && freq <= 6000 { // plausible WiFi freq
+-							return freq
+-						}
+-					}
+-				}
+-			}
+-		}
+-	}
+-
++	if r != nil && len(r.RadioTapValues) > 0 {
++		return int(r.RadioTapValues[0].ChannelFrequency)
++	}
+ 	return 0
+ }
+ 
+-// helper: extract dBm antenna signal (RSSI) from RadioTap
+ func dbmFromRadioTap(r *layers.RadioTap) int {
+-	if r == nil {
+-		return 0
+-	}
+-
+-	// try direct exported field via reflection
+-	rv := reflect.ValueOf(r)
+-	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+-		rv = rv.Elem()
+-		if rv.IsValid() && rv.Kind() == reflect.Struct {
+-			if f := rv.FieldByName("DBMAntennaSignal"); f.IsValid() {
+-				switch f.Kind() {
+-				case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int:
+-					return int(f.Int())
+-				case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+-					u := f.Uint()
+-					if u <= 0xFF {
+-						return int(int8(uint8(u)))
+-					}
+-					return int(u)
+-				}
+-			}
+-		}
+-	}
+-
+-	// fallback: scan RadioTapValues for a 1-byte RSSI-like value (-150..0)
+-	for _, ns := range r.RadioTapValues {
+-		sv := reflect.ValueOf(ns)
+-		if sv.Kind() == reflect.Struct {
+-			for _, name := range []string{"Data", "Value"} {
+-				if f := sv.FieldByName(name); f.IsValid() && f.Kind() == reflect.Slice && f.Type().Elem().Kind() == reflect.Uint8 {
+-					b := f.Bytes()
+-					if len(b) >= 1 {
+-						rssi := int(int8(b[0]))
+-						if rssi <= 0 && rssi >= -150 {
+-							return rssi
+-						}
+-					}
+-				}
+-			}
+-		}
+-	}
+-
++	if r != nil && len(r.RadioTapValues) > 0 {
++		return int(r.RadioTapValues[0].DBMAntennaSignal)
++	}
+ 	return 0
+ }
+--- /dev/null
++++ b/mesh/peer_radiotap_test.go
+@@ -0,0 +1,18 @@
++package mesh
++
++import (
++	"github.com/gopacket/gopacket/layers"
++	"testing"
++)
++
++func TestRadioTapMetadata(t *testing.T) {
++	for _, freq := range []layers.RadioTapChannelFrequency{2412, 5180, 5745} {
++		r := &layers.RadioTap{RadioTapValues: []layers.RadioTapNamespace{{ChannelFrequency: freq, DBMAntennaSignal: -47}}}
++		if channelFromRadioTap(r) != int(freq) || dbmFromRadioTap(r) != -47 {
++			t.Fatal("lost typed radio metadata")
++		}
++	}
++	if channelFromRadioTap(nil) != 0 || dbmFromRadioTap(&layers.RadioTap{}) != 0 {
++		t.Fatal("empty metadata")
++	}
++}
+--- a/mesh/packet_muxer.go
++++ b/mesh/packet_muxer.go
+@@ -127,15 +127,11 @@
+ 			return nil
+ 		} else if strings.Contains(err.Error(), "temporarily unavailable") {
+ 			log.Debug("resource temporarily unavailable when sending data")
+-			// if it's the last attempt this will set err to nil as we can't really
+-			// do a lot about this case, otherwise it'll wait 200ms before the next
+-			// attempt is made.
+-			err = nil
+-			if attempt < 5 {
++			if attempt < 4 {
+ 				time.Sleep(200 * time.Millisecond)
+ 			}
+ 		} else {
+-			return nil
++			return err
+ 		}
+ 	}
+ 	return err
